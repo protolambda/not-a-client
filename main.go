@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -50,8 +49,9 @@ func main()  {
 		check(err)
 		f, err := os.Open(genesisFile)
 		check(err)
-		genesisState, err = beacon.AsBeaconStateView(beacon.BeaconStateType.Deserialize(bufio.NewReader(f), uint64(fSt.Size())))
+		genesisState, err = beacon.AsBeaconStateView(beacon.BeaconStateType.Deserialize(f, uint64(fSt.Size())))
 		check(err)
+		check(f.Close())
 		log.Infoln("loaded genesis state")
 	}
 
@@ -104,7 +104,7 @@ func main()  {
 	// connect to bootnode
 	var bootID peer.ID
 	{
-		bootnodeEnr := ""
+		bootnodeEnr := "enr:-Iu4QGuiaVXBEoi4kcLbsoPYX7GTK9ExOODTuqYBp9CyHN_PSDtnLMCIL91ydxUDRPZ-jem-o0WotK6JoZjPQWhTfEsTgmlkgnY0gmlwhDbOLfeJc2VjcDI1NmsxoQLVqNEoCVTC74VmUx25USyFe7lL0TgpXHaCX9CDy9H6boN0Y3CCIyiDdWRwgiMo"
 		enrAddr, err := addrutil.ParseEnrOrEnode(bootnodeEnr)
 		check(err)
 		muAddr, err := addrutil.EnodeToMultiAddr(enrAddr)
@@ -129,6 +129,8 @@ func main()  {
 		if err != nil {
 			return nil, err
 		}
+		// starting from next slot
+		slot += 1
 		req := reqresp.RequestSSZInput{
 			Obj: &methods.BlocksByRangeReqV1{
 				HeadBlockRoot: methods.Root{}, // can be ignored
@@ -137,7 +139,7 @@ func main()  {
 				Step:          1,
 			},
 		}
-		log.Info("Requesting slots %d - %d", slot, uint64(slot) + count)
+		log.Infof("Requesting slots %d - %d", slot, uint64(slot) + count)
 
 		blocks := make([]*beacon.SignedBeaconBlock, 0, count)
 
@@ -145,7 +147,7 @@ func main()  {
 		err = methods.BlocksByRangeRPCv1.RunRequest(reqCtx, h.NewStream, bootID, nil, &req, count,
 			func(chunk reqresp.ChunkedResponseHandler) error {
 				resultCode := chunk.ResultCode()
-				log.Info("got chunk! chunk index: %d, chunk size: %d, result code: %d", chunk.ChunkIndex(), chunk.ChunkSize(), resultCode)
+				log.Infof("got chunk! chunk index: %d, chunk size: %d, result code: %d", chunk.ChunkIndex(), chunk.ChunkSize(), resultCode)
 
 				switch resultCode {
 				case reqresp.ServerErrCode, reqresp.InvalidReqCode:
@@ -162,7 +164,7 @@ func main()  {
 					}
 					blocks = append(blocks, &block)
 					blockRoot := zssz.HashTreeRoot(htr.HashFn(hashing.GetHashFn()), &block, beacon.SignedBeaconBlockSSZ)
-					log.Info("Buffered block for slot %d root %x", block.Message.Slot, blockRoot)
+					log.Infof("Buffered block for slot %d root %x", block.Message.Slot, blockRoot)
 				}
 				return nil
 			})
@@ -173,13 +175,14 @@ func main()  {
 	state := genesisState
 	epc, err := state.NewEpochsContext()
 	check(err)
+	totalTime := float64(0)
 	syncLoop: for {
 		slot, err := state.Slot()
 		check(err)
 
-		log.Info("state at slot %d -- state root: %x", slot, state.HashTreeRoot(tree.GetHashFn()))
+		log.Infof("state at slot %d -- state root: %x", slot, state.HashTreeRoot(tree.GetHashFn()))
 
-		if slot > 100 {
+		if slot > 10000 {
 			break
 		}
 
@@ -194,26 +197,53 @@ func main()  {
 			// continue, at least something to process
 		}
 
-		pre, err := beacon.AsBeaconStateView(state.Copy())
-		check(err)
-		preEpc := epc.Copy()
-		batchStartTime := time.Now()
+		batchTime := float64(0)
+
 		for _, b := range blocks {
+
+			workState, err := beacon.AsBeaconStateView(state.Copy())
+			check(err)
+			workEpc := epc.Copy()
+
 			startTime := time.Now()
-			err := pre.StateTransition(preEpc, b, true)
-			if err != nil {
+			if err := workState.StateTransition(workEpc, b, true); err != nil {
 				log.Errorf("failed to process block at slot %d: %v", b.Message.Slot, err)
-				continue syncLoop
+
+				{
+					f, err := os.Create("pre.ssz")
+					check(err)
+					check(state.Serialize(f))
+					check(f.Close())
+				}
+				{
+					f, err := os.Create("post.ssz")
+					check(err)
+					check(workState.Serialize(f))
+					check(f.Close())
+				}
+				{
+					f, err := os.Create("block.ssz")
+					check(err)
+					_, err = zssz.Encode(f, b, beacon.SignedBeaconBlockSSZ)
+					check(err)
+					check(f.Close())
+				}
+
+				// stop
+				break syncLoop
 			}
 			processDelta := time.Since(startTime)
+			batchTime += processDelta.Seconds()
+			totalTime += processDelta.Seconds()
 
-			log.Info("processed block for slot %d successfully! duration: %s", b.Message.Slot, processDelta.String())
+			epc = workEpc
+			state = workState
+
+			log.Infof("processed block for slot %d successfully! duration: %f ms", b.Message.Slot, batchTime*1000.0)
 		}
-		batchDelta := time.Since(batchStartTime)
-		slots := blocks[len(blocks)-1].Message.Slot - blocks[0].Message.Slot
-		log.Info("processed batch of %d blocks (%d slots). Time: %s  (%f slots / second)", len(blocks), slots, batchDelta.String(), 1.0 / batchDelta.Seconds())
-		epc = preEpc
-		state = pre
+		slotsDelta := blocks[len(blocks)-1].Message.Slot - blocks[0].Message.Slot
+		log.Infof("processed batch of %d blocks (%d slots). Time: %f  (%f slots / second)", len(blocks), slotsDelta, batchTime*1000.0, float64(slotsDelta) / batchTime)
+		log.Infof("total aggregate processing time: %f seconds. (%f slots / second)", totalTime, float64(slot)/totalTime)
 	}
 
 	closeHost()

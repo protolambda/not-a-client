@@ -1,4 +1,4 @@
-module not-a-client
+module github.com/protolambda/not-a-client
 
 go 1.14
 
