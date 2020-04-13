@@ -24,16 +24,14 @@ type ChainEntry interface {
 	// BlockRoot returns the last block root, replicating the previous block root if the current slot has none.
 	// If replicated, `here` will be false.
 	BlockRoot() (root Root, here bool)
-	// State root (of the post-state of this entry). Should match state-root in the block at the same slot.
+	// The parent block root. If this is an empty slot, return ok=false.
+	ParentRoot() (root Root, ok bool)
+	// State root (of the post-state of this entry). Should match state-root in the block at the same slot (if any)
 	StateRoot() Root
 	// The context of this chain entry (shuffling, proposers, etc.)
 	EpochsContext(ctx context.Context) (*beacon.EpochsContext, error)
 	// State of the entry, a data-sharing view. Call .Copy() before modifying this to preserve validity.
 	State(ctx context.Context) (*beacon.BeaconStateView, error)
-	// Block of the entry, can be nil without error if the slot is empty.
-	Block(ctx context.Context) (*beacon.BeaconBlock, error)
-	// Header of the entry, can be nil without error if the slot is empty.
-	Header(ctx context.Context) (*beacon.BeaconBlockHeader, error)
 }
 
 type Chain interface {
@@ -43,79 +41,37 @@ type Chain interface {
 	BySlot(slot Slot) (ChainEntry, error)
 }
 
-type HotEmptyEntry struct {
-	slot Slot
-	epc *beacon.EpochsContext
-	// state is not a full a copy, it data-shares part of the tree with other hot states.
-	state *beacon.BeaconStateView
-}
-
-func (e *HotEmptyEntry) Slot() Slot {
-	return e.slot
-}
-
-func (e *HotEmptyEntry) BlockRoot() (root Root, here bool) {
-	return Root{}, false
-}
-
-func (e *HotEmptyEntry) StateRoot() Root {
-	return e.state.HashTreeRoot(tree.GetHashFn())
-}
-
-func (e *HotEmptyEntry) EpochsContext(ctx context.Context) (*beacon.EpochsContext, error) {
-	return e.epc, nil
-}
-
-func (e *HotEmptyEntry) State(ctx context.Context) (*beacon.BeaconStateView, error) {
-	return e.state, nil
-}
-
-func (e *HotEmptyEntry) Block(ctx context.Context) (*beacon.BeaconBlock, error) {
-	return nil, nil
-}
-
-func (e *HotEmptyEntry) Header(ctx context.Context) (*beacon.BeaconBlockHeader, error) {
-	return nil, nil
-}
-
-type HotBlockEntry struct {
+type HotEntry struct {
 	slot Slot
 	epc *beacon.EpochsContext
 	state *beacon.BeaconStateView
-	// Cached, since structural objects do not cache hash-tree-root, unlike views (like the state)
 	blockRoot Root
-	block *beacon.BeaconBlock
+	parentRoot Root
 }
 
-func (e *HotBlockEntry) Slot() Slot {
+func (e *HotEntry) Slot() Slot {
 	return e.slot
 }
 
-func (e *HotBlockEntry) BlockRoot() (root Root, here bool) {
-	if e.blockRoot == (Root{}) {
-		e.blockRoot = e.block.HashTreeRoot()
-	}
-	return e.blockRoot, true
+func (e *HotEntry) ParentRoot() (root Root, ok bool) {
+	return e.parentRoot, e.parentRoot == Root{}
 }
 
-func (e *HotBlockEntry) StateRoot() Root {
+func (e *HotEntry) BlockRoot() (root Root, here bool) {
+	return e.blockRoot, e.parentRoot == Root{}
+}
+
+func (e *HotEntry) StateRoot() Root {
 	return e.state.HashTreeRoot(tree.GetHashFn())
 }
 
-func (e *HotBlockEntry) EpochsContext(ctx context.Context) (*beacon.EpochsContext, error) {
-	return e.epc, nil
+func (e *HotEntry) EpochsContext(ctx context.Context) (*beacon.EpochsContext, error) {
+	return e.epc.Clone(), nil
 }
 
-func (e *HotBlockEntry) State(ctx context.Context) (*beacon.BeaconStateView, error) {
-	return e.state, nil
-}
-
-func (e *HotBlockEntry) Block(ctx context.Context) (*beacon.BeaconBlock, error) {
-	return e.block, nil
-}
-
-func (e *HotBlockEntry) Header(ctx context.Context) (*beacon.BeaconBlockHeader, error) {
-	return e.block.Header(), nil
+func (e *HotEntry) State(ctx context.Context) (*beacon.BeaconStateView, error) {
+	// Return a copy of the view, the state itself may not be modified
+	return beacon.AsBeaconStateView(e.state.Copy())
 }
 
 type HotChain interface {
@@ -123,7 +79,7 @@ type HotChain interface {
 	Justified() Checkpoint
 	Finalized() Checkpoint
 	Head() (ChainEntry, error)
-	AddBlock(block *beacon.BeaconBlock, post *beacon.BeaconStateView) error
+	AddBlock(ctx context.Context, signedBlock *beacon.SignedBeaconBlock) error
 	AddAttestation(att *beacon.Attestation) error
 }
 
@@ -148,9 +104,35 @@ type UnfinalizedChain struct {
 	ForkChoice *forkchoice.ForkChoice
 
 	// block++slot -> Entry
-	Entries map[BlockSlotKey]ChainEntry
+	Entries map[BlockSlotKey]*HotEntry
 	// state root -> block+slot key
 	State2Key map[Root]BlockSlotKey
+}
+
+func (uc *UnfinalizedChain) OnPrunedBlock(node *forkchoice.ProtoNode) (pruned []ChainEntry) {
+	blockRef := node.Block
+
+	key := NewBlockSlotKey(blockRef.Root, blockRef.Slot)
+	entry, ok := uc.Entries[key]
+	if ok {
+		// Return the block
+		pruned = append(pruned, entry)
+		// Remove block from hot state
+		delete(uc.Entries, key)
+		delete(uc.State2Key, entry.StateRoot())
+		// There may be empty slots leading up to the block
+		prevBlockRoot, _ := entry.ParentRoot()
+		for slot := blockRef.Slot; true; slot-- {
+			key = NewBlockSlotKey(prevBlockRoot, slot)
+			entry, ok = uc.Entries[key]
+			if ok {
+				pruned = append(pruned, entry)
+			} else {
+				break
+			}
+		}
+	}
+	return
 }
 
 func (uc *UnfinalizedChain) ByStateRoot(root Root) (ChainEntry, error) {
@@ -185,7 +167,7 @@ func (uc *UnfinalizedChain) ClosestFrom(fromBlockRoot Root, toSlot Slot) (ChainE
 	if at.Root != (Root{}) {
 		return uc.ByBlockSlot(NewBlockSlotKey(at.Root, at.Slot))
 	}
-	for slot := at.Slot; slot >= before.Slot && slot != 0; slot-- {
+	for slot := toSlot; slot >= before.Slot && slot != 0; slot-- {
 		key := NewBlockSlotKey(before.Root, slot)
 		entry, ok := uc.Entries[key]
 		if ok {
@@ -222,12 +204,79 @@ func (uc *UnfinalizedChain) Head() (ChainEntry, error) {
 	return uc.ByBlockRoot(ref.Root)
 }
 
-func (uc *UnfinalizedChain) AddBlock(block *beacon.BeaconBlock, post *beacon.BeaconStateView) error {
+func (uc *UnfinalizedChain) AddBlock(ctx context.Context, signedBlock *beacon.SignedBeaconBlock) error {
+	block := &signedBlock.Message
 	blockRoot := block.HashTreeRoot()
+
+	pre, err := uc.ClosestFrom(block.ParentRoot, block.Slot)
+	if err != nil {
+		return err
+	}
+
+	if root, ok := pre.BlockRoot(); !ok || root != block.ParentRoot {
+		return fmt.Errorf("unknown parent root %x, found other root %x (ok: %v)", block.ParentRoot, root, ok)
+	}
+
+	epc, err := pre.EpochsContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	state, err := pre.State(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Process empty slots
+	for slot := pre.Slot() + 1; slot < block.Slot; {
+		if err := state.ProcessSlot(); err != nil {
+			return err
+		}
+		// Per-epoch transition happens at the start of the first slot of every epoch.
+		// (with the slot still at the end of the last epoch)
+		isEpochEnd := (slot + 1).ToEpoch() != slot.ToEpoch()
+		if isEpochEnd {
+			if err := state.ProcessEpoch(epc); err != nil {
+				return err
+			}
+		}
+		slot += 1
+		if err := state.SetSlot(slot); err != nil {
+			return err
+		}
+		if isEpochEnd {
+			if err := epc.RotateEpochs(state); err != nil {
+				return err
+			}
+		}
+
+		// Add empty slot entry
+		uc.Entries[NewBlockSlotKey(block.ParentRoot, slot)] = &HotEntry{
+			slot:      block.Slot,
+			epc:       nil,
+			state:     state,
+			blockRoot: blockRoot,
+			parentRoot: Root{},
+		}
+
+		state, err = beacon.AsBeaconStateView(state.Copy())
+		if err != nil {
+			return err
+		}
+		epc = epc.Clone()
+	}
+
+	if err := state.StateTransition(epc, signedBlock, true); err != nil {
+		return err
+	}
+	// And seal the state, need the header and block/state roots to update.
+	if err := state.ProcessSlot(); err != nil {
+		return err
+	}
 
 	var finalizedEpoch, justifiedEpoch Epoch
 	{
-		finalizedCh, err := post.FinalizedCheckpoint()
+		finalizedCh, err := state.FinalizedCheckpoint()
 		if err != nil {
 			return err
 		}
@@ -235,7 +284,7 @@ func (uc *UnfinalizedChain) AddBlock(block *beacon.BeaconBlock, post *beacon.Bea
 		if err != nil {
 			return err
 		}
-		justifiedCh, err := post.CurrentJustifiedCheckpoint()
+		justifiedCh, err := state.CurrentJustifiedCheckpoint()
 		if err != nil {
 			return err
 		}
@@ -245,6 +294,13 @@ func (uc *UnfinalizedChain) AddBlock(block *beacon.BeaconBlock, post *beacon.Bea
 		}
 	}
 
+	uc.Entries[NewBlockSlotKey(blockRoot, block.Slot)] = &HotEntry{
+		slot:      block.Slot,
+		epc:       nil,
+		state:     state,
+		blockRoot: blockRoot,
+		parentRoot: block.ParentRoot,
+	}
 	uc.ForkChoice.ProcessBlock(
 		forkchoice.BlockRef{Slot: block.Slot, Root: blockRoot},
 		block.ParentRoot, justifiedEpoch, finalizedEpoch)
@@ -257,11 +313,11 @@ func (uc *UnfinalizedChain) AddAttestation(att *beacon.Attestation) error {
 	if err != nil {
 		return err
 	}
-	_, ok := block.(*HotBlockEntry)
+	_, ok := block.(*HotEntry)
 	if !ok {
-		return errors.New("expected HotBlockEntry, need epochs-context to be present")
+		return errors.New("expected HotEntry, need epochs-context to be present")
 	}
-	// HotBlockEntry does not use a context, epochs-context is available.
+	// HotEntry does not use a context, epochs-context is available.
 	epc, err := block.EpochsContext(nil)
 	if err != nil {
 		return err
@@ -285,15 +341,17 @@ func (uc *UnfinalizedChain) AddAttestation(att *beacon.Attestation) error {
 type ColdChain interface {
 	Start() Slot
 	End() Slot
-	AddBlock(empties []HotEmptyEntry, block HotBlockEntry)
+	AddBlock(empties []*HotEntry, block HotEntry)
 	Chain
 }
 
 type FinalizedEntry struct {
 	slot Slot
 
-	// Zeroed if empty.
+	// Can be copy of the previous root if empty
 	blockRoot Root
+	// Zeroed if empty.
+	parentRoot Root
 
 	stateRoot Root
 }
@@ -302,8 +360,12 @@ func (e *FinalizedEntry) Slot() Slot {
 	return e.slot
 }
 
+func (e *FinalizedEntry) ParentRoot() (root Root, ok bool) {
+	return e.parentRoot, e.parentRoot == Root{}
+}
+
 func (e *FinalizedEntry) BlockRoot() (root Root, here bool) {
-	return e.blockRoot, e.blockRoot == (Root{})
+	return e.blockRoot, e.parentRoot == (Root{})
 }
 
 func (e *FinalizedEntry) StateRoot() Root {
@@ -321,22 +383,6 @@ func (e *FinalizedEntryView) EpochsContext(ctx context.Context) (*beacon.EpochsC
 
 func (e *FinalizedEntryView) State(ctx context.Context) (*beacon.BeaconStateView, error) {
 	return e.finChain.getState(ctx, e.slot)
-}
-
-func (e *FinalizedEntryView) Block(ctx context.Context) (*beacon.BeaconBlock, error) {
-	if e.blockRoot == (Root{}) {
-		// empty slot
-		return nil, nil
-	}
-	return e.finChain.getBlock(ctx, e.slot)
-}
-
-func (e *FinalizedEntryView) Header(ctx context.Context) (*beacon.BeaconBlockHeader, error) {
-	if e.blockRoot == (Root{}) {
-		// empty slot
-		return nil, nil
-	}
-	return e.finChain.getHeader(ctx, e.slot)
 }
 
 type FinalizedChain struct {
@@ -412,15 +458,30 @@ func (f *FinalizedChain) BySlot(slot Slot) (ChainEntry, error) {
 	}, nil
 }
 
-func (f *FinalizedChain) Proposers(epoch Epoch) ([beacon.SLOTS_PER_EPOCH]ValidatorIndex, error) {
+func (f *FinalizedChain) OnFinalizedBlock(block forkchoice.BlockRef, state *beacon.BeaconStateView, epc *beacon.EpochsContext) {
+	postStateRoot := state.HashTreeRoot(tree.GetHashFn())
+	f.History = append(f.History, FinalizedEntry{
+		slot:      block.Slot,
+		blockRoot: block.Root,
+		stateRoot: postStateRoot,
+	})
+	// If it's a new epoch, store the proposers for the epoch
+	if block.Slot.ToEpoch() > f.End().ToEpoch() {
+		f.ProposerHistory = append(f.ProposerHistory, *epc.Proposers)
+	}
+	f.BlockRoots[block.Root] = block.Slot
+	f.StateRoots[postStateRoot] = block.Slot
+}
+
+func (f *FinalizedChain) Proposers(epoch Epoch) (*[beacon.SLOTS_PER_EPOCH]ValidatorIndex, error) {
 	anchorEpoch := f.AnchorSlot.ToEpoch()
 	if epoch < anchorEpoch {
-		return [beacon.SLOTS_PER_EPOCH]ValidatorIndex{}, errors.New("epoch too early for finalized chain")
+		return nil, errors.New("epoch too early for finalized chain")
 	}
 	if max := f.End().ToEpoch(); epoch > max {
-		return [beacon.SLOTS_PER_EPOCH]ValidatorIndex{}, errors.New("epoch too late for finalized chain")
+		return nil, errors.New("epoch too late for finalized chain")
 	}
-	return f.ProposerHistory[epoch-anchorEpoch], nil
+	return &f.ProposerHistory[epoch-anchorEpoch], nil
 }
 
 func (f *FinalizedChain) getEpochsContext(ctx context.Context, slot Slot) (*beacon.EpochsContext, error) {
@@ -435,22 +496,18 @@ func (f *FinalizedChain) getEpochsContext(ctx context.Context, slot Slot) (*beac
 	}
 	// We do not store shuffling for older epochs
 	// TODO: maybe store it after all, for archive node functionality?
-	if err := epc.LoadShuffling(nil /* TODO shuffle load? */); err != nil {
+	state, err := f.getState(ctx, slot)
+	if err != nil {
 		return nil, err
 	}
-	return nil, errors.New("todo")
+	if err := epc.LoadShuffling(state); err != nil {
+		return nil, err
+	}
+	return epc, nil
 }
 
 func (f *FinalizedChain) getState(ctx context.Context, slot Slot) (*beacon.BeaconStateView, error) {
-	return nil, errors.New("todo")
-}
-
-func (f *FinalizedChain) getBlock(ctx context.Context, slot Slot) (*beacon.BeaconBlock, error) {
-	return nil, errors.New("todo")
-}
-
-func (f *FinalizedChain) getHeader(ctx context.Context, slot Slot) (*beacon.BeaconBlockHeader, error) {
-	return nil, errors.New("todo")
+	return nil, errors.New("todo: load state froms tate storage")
 }
 
 type FullChain struct {
