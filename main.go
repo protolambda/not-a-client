@@ -203,10 +203,9 @@ func main()  {
 
 			workState, err := beacon.AsBeaconStateView(state.Copy())
 			check(err)
-			workEpc := epc.Copy()
 
 			startTime := time.Now()
-			if err := workState.StateTransition(workEpc, b, true); err != nil {
+			if err := workState.StateTransition(epc, b, true); err != nil {
 				log.Errorf("failed to process block at slot %d: %v", b.Message.Slot, err)
 
 				{
@@ -236,7 +235,6 @@ func main()  {
 			batchTime += processDelta.Seconds()
 			totalTime += processDelta.Seconds()
 
-			epc = workEpc
 			state = workState
 
 			log.Infof("processed block for slot %d successfully! duration: %f ms", b.Message.Slot, batchTime*1000.0)
