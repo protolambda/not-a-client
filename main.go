@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"github.com/libp2p/go-libp2p"
 	connmgr "github.com/libp2p/go-libp2p-connmgr"
 	"github.com/libp2p/go-libp2p-core/crypto"
@@ -25,10 +26,11 @@ import (
 	"github.com/protolambda/ztyp/tree"
 	"github.com/sirupsen/logrus"
 	"os"
+	"sync"
 	"time"
 )
 
-func main()  {
+func main() {
 
 	check := func(err error) {
 		if err != nil {
@@ -44,7 +46,7 @@ func main()  {
 	// load genesis
 	var genesisState *beacon.BeaconStateView
 	{
-		genesisFile := "genesis.ssz"
+		genesisFile := "topaz_genesis.ssz"
 		fSt, err := os.Stat(genesisFile)
 		check(err)
 		f, err := os.Open(genesisFile)
@@ -68,7 +70,7 @@ func main()  {
 		check(err)
 		log.WithFields(logrus.Fields{
 			"priv": hex.EncodeToString(privBytes),
-			"pub": hex.EncodeToString(pubBytes),
+			"pub":  hex.EncodeToString(pubBytes),
 		}).Info("made keypair")
 
 		loPeers := 15
@@ -101,10 +103,117 @@ func main()  {
 		}
 	}
 
+	backgroundRpcCtxFn := func() context.Context { return hostCtx }
+
+	peerInfoStore := PeerInfos{}
+
+	ourMetadata := MetaData{SeqNumber: 1}
+
+	// Handle ping
+	pingHandler := func(ctx context.Context, peerId peer.ID, handler reqresp.ChunkedRequestHandler) {
+		var ping methods.Ping
+		if err := handler.ReadRequest(&ping); err != nil {
+			log.WithFields(logrus.Fields{"err": err, "peer": peerId}).Debug("got bad ping")
+			_ = handler.WriteInvalidRequestChunk("bad ping")
+			return
+		}
+		currentInfo, _ := peerInfoStore.Find(peerId)
+		if newer := currentInfo.RegisterSeqClaim(uint64(ping)); !newer {
+			log.WithFields(logrus.Fields{"ping": ping, "peer": peerId}).Debug("got old ping")
+			// Got ping, but had better claim earlier. Bad peer
+			_ = handler.WriteInvalidRequestChunk("ping is old")
+			return
+		} else {
+			// Stop trying to fetch after too many tries
+			if fetchCount := currentInfo.RegisterMetaFetch(); fetchCount < MaxMetadataTries {
+				log.WithFields(logrus.Fields{
+					"ping": ping, "info": currentInfo.String(), "peer": peerId,
+				}).Debug("interested in ping, retrieving metadata")
+				// TODO request metadata in go routine
+			}
+		}
+
+		pong := methods.Pong(ourMetadata.SeqNumber)
+		if err := handler.WriteResponseChunk(&pong); err != nil {
+			log.WithFields(logrus.Fields{"err": err, "pong": pong, "peer": peerId}).Debug("failed to write pong")
+		} else {
+			log.WithFields(logrus.Fields{"pong": pong, "peer": peerId}).Debug("responded with pong")
+		}
+	}
+	h.SetStreamHandler(methods.PingRPCv1.Protocol+"_snappy",
+		methods.PingRPCv1.MakeStreamHandler(backgroundRpcCtxFn, reqresp.SnappyCompression{}, pingHandler))
+	h.SetStreamHandler(methods.PingRPCv1.Protocol,
+		methods.PingRPCv1.MakeStreamHandler(backgroundRpcCtxFn, nil, pingHandler))
+
+	// Handle metadata
+	metadataHandler := func(ctx context.Context, peerId peer.ID, handler reqresp.ChunkedRequestHandler) {
+		if err := handler.WriteResponseChunk(&ourMetadata); err != nil {
+			log.WithFields(logrus.Fields{"err": err, "md": ourMetadata, "peer": peerId}).Debug("failed to write metadata")
+		} else {
+			log.WithFields(logrus.Fields{"md": ourMetadata, "peer": peerId}).Debug("responded with metadata")
+		}
+	}
+	h.SetStreamHandler(methods.MetaDataRPCv1.Protocol+"_snappy",
+		methods.MetaDataRPCv1.MakeStreamHandler(backgroundRpcCtxFn, reqresp.SnappyCompression{}, metadataHandler))
+	h.SetStreamHandler(methods.MetaDataRPCv1.Protocol,
+		methods.MetaDataRPCv1.MakeStreamHandler(backgroundRpcCtxFn, nil, metadataHandler))
+
+	checkFatal := func(err error) {
+		if err != nil {
+			log.Error(err)
+			os.Exit(1)
+		}
+	}
+
+	forkV, err := genesisState.Fork()
+	checkFatal(err)
+	fork, err := forkV.Raw()
+	checkFatal(err)
+	genValRoot, err := genesisState.GenesisValidatorsRoot()
+	checkFatal(err)
+	forkDigest := beacon.ComputeForkDigest(fork.CurrentVersion, genValRoot)
+
+	forkVersion := [4]byte{240, 113, 198, 108}
+	if forkDigest != forkVersion {
+		log.Error("unexpected fork digest")
+		os.Exit(1)
+	}
+
+	ourStatus := Status{
+		HeadForkVersion: methods.ForkVersion(forkVersion),
+		FinalizedRoot:   methods.Root{},
+		FinalizedEpoch:  0,
+		HeadRoot:        methods.Root(genesisState.HashTreeRoot(tree.GetHashFn())),
+		HeadSlot:        0,
+	}
+	// Handle status
+	statusHandler := func(ctx context.Context, peerId peer.ID, handler reqresp.ChunkedRequestHandler) {
+		var peerStatus methods.Status
+		if err := handler.ReadRequest(&peerStatus); err != nil {
+			log.WithFields(logrus.Fields{"err": err, "peer": peerId}).Debug("got bad status")
+			_ = handler.WriteInvalidRequestChunk("bad status")
+			return
+		}
+		currentInfo, _ := peerInfoStore.Find(peerId)
+		currentInfo.RegisterStatus(peerStatus)
+		log.WithFields(logrus.Fields{"status": peerStatus, "peer": peerId}).Debug("received status update")
+
+		sentStatus := ourStatus
+		if err := handler.WriteResponseChunk(&sentStatus); err != nil {
+			log.WithFields(logrus.Fields{"err": err, "sent": sentStatus.String(), "peer": peerId}).Debug("failed to write pong")
+		} else {
+			log.WithFields(logrus.Fields{"sent": sentStatus.String(), "peer": peerId}).Debug("responded with status")
+		}
+	}
+	h.SetStreamHandler(methods.StatusRPCv1.Protocol+"_snappy",
+		methods.StatusRPCv1.MakeStreamHandler(backgroundRpcCtxFn, reqresp.SnappyCompression{}, statusHandler))
+	h.SetStreamHandler(methods.StatusRPCv1.Protocol,
+		methods.StatusRPCv1.MakeStreamHandler(backgroundRpcCtxFn, nil, statusHandler))
+
 	// connect to bootnode
 	var bootID peer.ID
 	{
-		bootnodeEnr := "enr:-Iu4QGuiaVXBEoi4kcLbsoPYX7GTK9ExOODTuqYBp9CyHN_PSDtnLMCIL91ydxUDRPZ-jem-o0WotK6JoZjPQWhTfEsTgmlkgnY0gmlwhDbOLfeJc2VjcDI1NmsxoQLVqNEoCVTC74VmUx25USyFe7lL0TgpXHaCX9CDy9H6boN0Y3CCIyiDdWRwgiMo"
+		bootnodeEnr := "enr:-LK4QEhBFOo5fvfbxcTVPcYsbg_5qQAxuRuxLNVbgPQXA9x9H0bNwYr_-4Q2gdMW8cq4JHgv-1fLsfXes4ZMDNh6528Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpDwccZsAAAAAP__________gmlkgnY0gmlwhDZd64iJc2VjcDI1NmsxoQPxitE8Ou_ce6dW_AyFqjEeJaRB5C2ohcHev_nL2tyWSoN0Y3CCIyiDdWRwgiMo"
 		enrAddr, err := addrutil.ParseEnrOrEnode(bootnodeEnr)
 		check(err)
 		muAddr, err := addrutil.EnodeToMultiAddr(enrAddr)
@@ -120,6 +229,28 @@ func main()  {
 		log.WithField("bootnode", bootID.Pretty()).Info("connected to bootnode")
 	}
 
+	{
+		// Ask node for status
+		reqCtx, _ := context.WithTimeout(hostCtx, time.Second*5)
+		req := reqresp.RequestSSZInput{
+			Obj: &ourStatus,
+		}
+		if err := methods.StatusRPCv1.RunRequest(reqCtx, h.NewStream, bootID, reqresp.SnappyCompression{}, &req, 1,
+			func(chunk reqresp.ChunkedResponseHandler) error {
+				var peerStatus Status
+				if err := chunk.ReadObj(&peerStatus); err != nil {
+					return err
+				}
+				currentInfo, _ := peerInfoStore.Find(bootID)
+				currentInfo.RegisterStatus(peerStatus)
+
+				log.WithFields(logrus.Fields{"status": peerStatus.String(), "peer": bootID}).Debug("retrieved peer status")
+				return nil
+			}); err != nil {
+			log.WithFields(logrus.Fields{"err": err, "peer": bootID}).Debug("failed getting peer status")
+		}
+	}
+
 	// Modify the RPC response codec to hook it up to ZRNT types
 	methods.BlocksByRangeRPCv1.ResponseChunkCodec = reqresp.NewSSZCodec((*beacon.SignedBeaconBlock)(nil))
 
@@ -133,18 +264,17 @@ func main()  {
 		slot += 1
 		req := reqresp.RequestSSZInput{
 			Obj: &methods.BlocksByRangeReqV1{
-				HeadBlockRoot: methods.Root{}, // can be ignored
-				StartSlot:     methods.Slot(slot),
-				Count:         count,
-				Step:          1,
+				StartSlot: methods.Slot(slot),
+				Count:     count,
+				Step:      1,
 			},
 		}
-		log.Infof("Requesting slots %d - %d", slot, uint64(slot) + count)
+		log.Infof("Requesting slots %d - %d", slot, uint64(slot)+count)
 
 		blocks := make([]*beacon.SignedBeaconBlock, 0, count)
 
 		reqCtx, _ := context.WithTimeout(hostCtx, time.Second*10)
-		err = methods.BlocksByRangeRPCv1.RunRequest(reqCtx, h.NewStream, bootID, nil, &req, count,
+		err = methods.BlocksByRangeRPCv1.RunRequest(reqCtx, h.NewStream, bootID, reqresp.SnappyCompression{}, &req, count,
 			func(chunk reqresp.ChunkedResponseHandler) error {
 				resultCode := chunk.ResultCode()
 				log.Infof("got chunk! chunk index: %d, chunk size: %d, result code: %d", chunk.ChunkIndex(), chunk.ChunkSize(), resultCode)
@@ -176,7 +306,8 @@ func main()  {
 	epc, err := state.NewEpochsContext()
 	check(err)
 	totalTime := float64(0)
-	syncLoop: for {
+syncLoop:
+	for {
 		slot, err := state.Slot()
 		check(err)
 
@@ -239,10 +370,104 @@ func main()  {
 
 			log.Infof("processed block for slot %d successfully! duration: %f ms", b.Message.Slot, batchTime*1000.0)
 		}
-		slotsDelta := blocks[len(blocks)-1].Message.Slot - blocks[0].Message.Slot
-		log.Infof("processed batch of %d blocks (%d slots). Time: %f  (%f slots / second)", len(blocks), slotsDelta, batchTime*1000.0, float64(slotsDelta) / batchTime)
-		log.Infof("total aggregate processing time: %f seconds. (%f slots / second)", totalTime, float64(slot)/totalTime)
+		if len(blocks) > 0 {
+			slotsDelta := blocks[len(blocks)-1].Message.Slot - blocks[0].Message.Slot
+			log.Infof("processed batch of %d blocks (%d slots). Time: %f  (%f slots / second)", len(blocks), slotsDelta, batchTime*1000.0, float64(slotsDelta)/batchTime)
+			log.Infof("total aggregate processing time: %f seconds. (%f slots / second)", totalTime, float64(slot)/totalTime)
+		} else {
+			log.Infoln("got no blocks, waiting for 5 seconds")
+			time.Sleep(time.Second * 5)
+		}
 	}
 
 	closeHost()
+}
+
+// Stop trying to fetch after this many tries
+const MaxMetadataTries = 10
+
+type MetaData = methods.MetaData
+type Status = methods.Status
+
+type PeerInfo struct {
+	md MetaData
+	// highest claimed seq nr
+	claimedSeq         uint64
+	status             Status
+	ongoingMetaFetches uint64
+	sync.Mutex
+}
+
+func (pi *PeerInfo) Metadata() MetaData {
+	return pi.md
+}
+
+func (pi *PeerInfo) ClaimedSeq() uint64 {
+	return pi.claimedSeq
+}
+
+func (pi *PeerInfo) Status() Status {
+	return pi.status
+}
+
+func (pi *PeerInfo) String() string {
+	return fmt.Sprintf("info:(meta: %s, claim: %d, status: %s, fetches: %d)",
+		pi.md.String(), pi.claimedSeq, pi.status.String(), pi.ongoingMetaFetches)
+}
+
+// RegisterSeqClaim updates the latest supposed seq nr of the peer
+func (pi *PeerInfo) RegisterSeqClaim(seq uint64) (newer bool) {
+	pi.Lock()
+	defer pi.Unlock()
+	newer = pi.claimedSeq < seq
+	if newer {
+		pi.claimedSeq = seq
+	}
+	return
+}
+
+// RegisterMetaFetch increments how many times we tried to get the peer metadata
+// without satisfying answer, returning the counter.
+func (pi *PeerInfo) RegisterMetaFetch() uint64 {
+	pi.Lock()
+	defer pi.Unlock()
+	pi.ongoingMetaFetches++
+	return pi.ongoingMetaFetches
+}
+
+// RegisterMetadata updates metadata, if newer than previous. Resetting ongoing fetch counter if it's new enough
+func (pi *PeerInfo) RegisterMetadata(md MetaData) (newer bool) {
+	pi.Lock()
+	defer pi.Unlock()
+	newer = pi.md.SeqNumber < md.SeqNumber
+	if newer {
+		if md.SeqNumber >= pi.claimedSeq {
+			// if it is newer or equal to best, we can reset the ongoing fetches
+			pi.ongoingMetaFetches = 0
+		}
+		pi.md = md
+		if pi.md.SeqNumber > pi.claimedSeq {
+			pi.claimedSeq = pi.md.SeqNumber
+		}
+	}
+	return
+}
+
+// RegisterStatus updates latest peer status
+func (pi *PeerInfo) RegisterStatus(st Status) {
+	pi.Lock()
+	defer pi.Unlock()
+	pi.status = st
+	return
+}
+
+type PeerInfos struct {
+	// peer.ID -> *PeerInfo
+	infos sync.Map
+}
+
+// Find looks for a peer info, and creates a new peer info if necessary
+func (ps *PeerInfos) Find(id peer.ID) (pi *PeerInfo, ok bool) {
+	pii, loaded := ps.infos.LoadOrStore(id, &PeerInfo{})
+	return pii.(*PeerInfo), loaded
 }
