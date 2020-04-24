@@ -16,7 +16,6 @@ import (
 	yamux "github.com/libp2p/go-libp2p-yamux"
 	"github.com/libp2p/go-tcp-transport"
 	ma "github.com/multiformats/go-multiaddr"
-	"github.com/protolambda/rumor/addrutil"
 	"github.com/protolambda/rumor/rpc/methods"
 	"github.com/protolambda/rumor/rpc/reqresp"
 	"github.com/protolambda/zrnt/eth2/beacon"
@@ -213,10 +212,11 @@ func main() {
 	// connect to bootnode
 	var bootID peer.ID
 	{
-		bootnodeEnr := "enr:-LK4QEhBFOo5fvfbxcTVPcYsbg_5qQAxuRuxLNVbgPQXA9x9H0bNwYr_-4Q2gdMW8cq4JHgv-1fLsfXes4ZMDNh6528Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpDwccZsAAAAAP__________gmlkgnY0gmlwhDZd64iJc2VjcDI1NmsxoQPxitE8Ou_ce6dW_AyFqjEeJaRB5C2ohcHev_nL2tyWSoN0Y3CCIyiDdWRwgiMo"
-		enrAddr, err := addrutil.ParseEnrOrEnode(bootnodeEnr)
-		check(err)
-		muAddr, err := addrutil.EnodeToMultiAddr(enrAddr)
+		//bootnodeEnr := "enr:-LK4QEhBFOo5fvfbxcTVPcYsbg_5qQAxuRuxLNVbgPQXA9x9H0bNwYr_-4Q2gdMW8cq4JHgv-1fLsfXes4ZMDNh6528Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpDwccZsAAAAAP__________gmlkgnY0gmlwhDZd64iJc2VjcDI1NmsxoQPxitE8Ou_ce6dW_AyFqjEeJaRB5C2ohcHev_nL2tyWSoN0Y3CCIyiDdWRwgiMo"
+		//enrAddr, err := addrutil.ParseEnrOrEnode(bootnodeEnr)
+		//check(err)
+		//muAddr, err := addrutil.EnodeToMultiAddr(enrAddr)
+		muAddr, err := ma.NewMultiaddr("/ip4/159.65.222.193/tcp/13000/p2p/16Uiu2HAmE8wajtMLTk4xrfhhLr93icGpHRGFfq74wzmciu4TkW3G")
 		check(err)
 		addrInfo, err := peer.AddrInfoFromP2pAddr(muAddr)
 		check(err)
@@ -303,6 +303,21 @@ func main() {
 
 	// Sync loop
 	state := genesisState
+
+	//var state *beacon.BeaconStateView
+	//{
+	//	stateFile := "beacon_state_64_topaz.ssz"
+	//	fSt, err := os.Stat(stateFile)
+	//	check(err)
+	//	f, err := os.Open(stateFile)
+	//	check(err)
+	//	state, err = beacon.AsBeaconStateView(beacon.BeaconStateType.Deserialize(f, uint64(fSt.Size())))
+	//	check(err)
+	//	check(f.Close())
+	//	log.Infoln("loaded starting state state")
+	//}
+
+
 	epc, err := state.NewEpochsContext()
 	check(err)
 	totalTime := float64(0)
@@ -317,7 +332,7 @@ syncLoop:
 			break
 		}
 
-		blocks, err := getBlocksBatch(state, 20)
+		blocks, err := getBlocksBatch(state, 64)
 		if err != nil {
 			log.Errorf("failed to get blocks batch, got %d blocks, err: %v", len(blocks), err)
 			if len(blocks) == 0 {
@@ -368,12 +383,12 @@ syncLoop:
 
 			state = workState
 
-			log.Infof("processed block for slot %d successfully! duration: %f ms", b.Message.Slot, batchTime*1000.0)
+			log.Infof("processed block for slot %d successfully! duration: %f ms", b.Message.Slot, processDelta.Seconds() * 1000.0)
 		}
 		if len(blocks) > 0 {
 			slotsDelta := blocks[len(blocks)-1].Message.Slot - blocks[0].Message.Slot
-			log.Infof("processed batch of %d blocks (%d slots). Time: %f  (%f slots / second)", len(blocks), slotsDelta, batchTime*1000.0, float64(slotsDelta)/batchTime)
-			log.Infof("total aggregate processing time: %f seconds. (%f slots / second)", totalTime, float64(slot)/totalTime)
+			log.Infof("processed batch of %d blocks (%d slots). Time: %f ms (%f slots / second)", len(blocks), slotsDelta, batchTime*1000.0, float64(slotsDelta)/batchTime)
+			log.Infof("total aggregate processing time: %f seconds. (%f slots / second)", totalTime, float64(slotsDelta)/totalTime)
 		} else {
 			log.Infoln("got no blocks, waiting for 5 seconds")
 			time.Sleep(time.Second * 5)
