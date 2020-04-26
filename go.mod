@@ -3,15 +3,18 @@ module github.com/protolambda/not-a-client
 go 1.14
 
 require (
+	github.com/golang/snappy v0.0.1
 	github.com/libp2p/go-libp2p v0.5.1
 	github.com/libp2p/go-libp2p-connmgr v0.2.1
 	github.com/libp2p/go-libp2p-core v0.3.1
 	github.com/libp2p/go-libp2p-mplex v0.2.1
 	github.com/libp2p/go-libp2p-peerstore v0.1.4
+	github.com/libp2p/go-libp2p-pubsub v0.2.6
 	github.com/libp2p/go-libp2p-secio v0.2.1
 	github.com/libp2p/go-libp2p-yamux v0.2.1
 	github.com/libp2p/go-tcp-transport v0.1.1
 	github.com/multiformats/go-multiaddr v0.2.0
+	github.com/pkg/profile v1.2.1
 	github.com/protolambda/rumor v0.0.0-20200408173933-468bcc1774f1
 	github.com/protolambda/zrnt v0.11.0
 	github.com/protolambda/zssz v0.1.4

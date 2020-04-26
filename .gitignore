@@ -16,3 +16,5 @@ logs
 
 # Debug files
 *.ssz
+
+pprof_data

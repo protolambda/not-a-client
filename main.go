@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"github.com/golang/snappy"
 	"github.com/libp2p/go-libp2p"
 	connmgr "github.com/libp2p/go-libp2p-connmgr"
 	"github.com/libp2p/go-libp2p-core/crypto"
@@ -12,10 +13,13 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 	mplex "github.com/libp2p/go-libp2p-mplex"
 	"github.com/libp2p/go-libp2p-peerstore/pstoremem"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	secio "github.com/libp2p/go-libp2p-secio"
 	yamux "github.com/libp2p/go-libp2p-yamux"
 	"github.com/libp2p/go-tcp-transport"
 	ma "github.com/multiformats/go-multiaddr"
+	"github.com/pkg/profile"
+	"github.com/protolambda/rumor/gossip"
 	"github.com/protolambda/rumor/rpc/methods"
 	"github.com/protolambda/rumor/rpc/reqresp"
 	"github.com/protolambda/zrnt/eth2/beacon"
@@ -25,6 +29,7 @@ import (
 	"github.com/protolambda/ztyp/tree"
 	"github.com/sirupsen/logrus"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -39,7 +44,7 @@ func main() {
 
 	log := logrus.New()
 	log.SetOutput(os.Stdout)
-	log.SetLevel(logrus.InfoLevel)
+	log.SetLevel(logrus.TraceLevel)
 	log.SetFormatter(&logrus.TextFormatter{ForceColors: true, DisableTimestamp: true})
 
 	// load genesis
@@ -172,14 +177,16 @@ func main() {
 	checkFatal(err)
 	forkDigest := beacon.ComputeForkDigest(fork.CurrentVersion, genValRoot)
 
-	forkVersion := [4]byte{240, 113, 198, 108}
-	if forkDigest != forkVersion {
+	expectedDigest := [4]byte{240, 113, 198, 108}
+	if forkDigest != expectedDigest {
 		log.Error("unexpected fork digest")
 		os.Exit(1)
 	}
 
+	log.Debugf("using fork digest: %x", forkDigest)
+
 	ourStatus := Status{
-		HeadForkVersion: methods.ForkVersion(forkVersion),
+		HeadForkVersion: methods.ForkVersion(forkDigest),
 		FinalizedRoot:   methods.Root{},
 		FinalizedEpoch:  0,
 		HeadRoot:        methods.Root(genesisState.HashTreeRoot(tree.GetHashFn())),
@@ -208,6 +215,72 @@ func main() {
 		methods.StatusRPCv1.MakeStreamHandler(backgroundRpcCtxFn, reqresp.SnappyCompression{}, statusHandler))
 	h.SetStreamHandler(methods.StatusRPCv1.Protocol,
 		methods.StatusRPCv1.MakeStreamHandler(backgroundRpcCtxFn, nil, statusHandler))
+
+
+	// Start gossip sub
+	{
+		psOptions := []pubsub.Option{
+			pubsub.WithMessageSigning(false),
+			pubsub.WithStrictSignatureVerification(false),
+			pubsub.WithMessageIdFn(gossip.MsgIDFunction),
+		}
+		ps, err := pubsub.NewGossipSub(hostCtx, h, psOptions...)
+		checkFatal(err)
+		handleEvents := func (ctx context.Context, topicName string, topic *pubsub.Topic) {
+			evHandler, err := topic.EventHandler()
+			checkFatal(err)
+			log.Infof("Started listening for peer join/leave events for topic %s", topicName)
+			for {
+				ev, err := evHandler.NextPeerEvent(ctx)
+				if err != nil {
+					log.Infof("Stopped listening for peer join/leave events for topic %s", topicName)
+					return
+				}
+				switch ev.Type {
+				case pubsub.PeerJoin:
+					log.WithField("join", ev.Peer.Pretty()).Infof("peer %s joined topic %s", ev.Peer.Pretty(), topicName)
+				case pubsub.PeerLeave:
+					log.WithField("leave", ev.Peer.Pretty()).Infof("peer %s left topic %s", ev.Peer.Pretty(), topicName)
+				}
+			}
+		}
+		blocksTopic, err := ps.Join(fmt.Sprintf("/eth2/%x/beacon_block/ssz_snappy", forkDigest))
+		checkFatal(err)
+		go handleEvents(hostCtx, "beacon_block", blocksTopic)
+		logTopicMsgs := func(ctx context.Context, topicName string, topic *pubsub.Topic) {
+			sub, err := blocksTopic.Subscribe()
+			checkFatal(err)
+			for {
+				msg, err := sub.Next(ctx)
+				if err != nil {
+					if err == ctx.Err() { // expected quit, context stopped.
+						break
+					}
+					log.Errorf("Gossip subscription on %s encountered error: %v", topicName, err)
+					break
+				} else {
+					var msgData []byte
+					if strings.HasSuffix(topicName, "_snappy") {
+						msgData, err = snappy.Decode(nil, msg.Data)
+						if err != nil {
+							log.Errorf("Cannot decode message on %s with snappy: %v", topicName, err)
+							return
+						}
+					} else {
+						msgData = msg.Data
+					}
+					log.WithFields(logrus.Fields{
+						"from":      msg.GetFrom().String(),
+						"data":      hex.EncodeToString(msgData),
+						"signature": hex.EncodeToString(msg.Signature),
+						"seq_no":    hex.EncodeToString(msg.Seqno),
+					}).Infof("new message on %s", topicName)
+				}
+			}
+			sub.Cancel()
+		}
+		go logTopicMsgs(hostCtx, "blocks", blocksTopic)
+	}
 
 	// connect to bootnode
 	var bootID peer.ID
@@ -301,7 +374,9 @@ func main() {
 		return blocks, err
 	}
 
-	// Sync loop
+
+
+	//Sync loop
 	state := genesisState
 
 	//var state *beacon.BeaconStateView
@@ -317,6 +392,7 @@ func main() {
 	//	log.Infoln("loaded starting state state")
 	//}
 
+	transitionProf := profile.Start(profile.ProfilePath("pprof_data"))
 
 	epc, err := state.NewEpochsContext()
 	check(err)
@@ -328,11 +404,11 @@ syncLoop:
 
 		log.Infof("state at slot %d -- state root: %x", slot, state.HashTreeRoot(tree.GetHashFn()))
 
-		if slot > 10000 {
+		if slot > 321 {
 			break
 		}
 
-		blocks, err := getBlocksBatch(state, 64)
+		blocks, err := getBlocksBatch(state, 32)
 		if err != nil {
 			log.Errorf("failed to get blocks batch, got %d blocks, err: %v", len(blocks), err)
 			if len(blocks) == 0 {
@@ -385,15 +461,20 @@ syncLoop:
 
 			log.Infof("processed block for slot %d successfully! duration: %f ms", b.Message.Slot, processDelta.Seconds() * 1000.0)
 		}
+
+		slot, err = state.Slot()
+		check(err)
+
 		if len(blocks) > 0 {
 			slotsDelta := blocks[len(blocks)-1].Message.Slot - blocks[0].Message.Slot
 			log.Infof("processed batch of %d blocks (%d slots). Time: %f ms (%f slots / second)", len(blocks), slotsDelta, batchTime*1000.0, float64(slotsDelta)/batchTime)
-			log.Infof("total aggregate processing time: %f seconds. (%f slots / second)", totalTime, float64(slotsDelta)/totalTime)
+			log.Infof("total aggregate processing time: %f seconds. (%f slots / second)", totalTime, float64(slot)/totalTime)
 		} else {
 			log.Infoln("got no blocks, waiting for 5 seconds")
 			time.Sleep(time.Second * 5)
 		}
 	}
+	transitionProf.Stop()
 
 	closeHost()
 }
